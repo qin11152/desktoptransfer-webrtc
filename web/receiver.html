@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebRTC Receiver</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: rgba(15, 23, 42, 0.88);
+      --line: rgba(148, 163, 184, 0.25);
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #22c55e;
+      --accent-2: #38bdf8;
+      --error: #f87171;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Noto Sans CJK SC", "Source Han Sans SC", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(56, 189, 248, 0.20), transparent 28%),
+        radial-gradient(circle at right, rgba(34, 197, 94, 0.18), transparent 22%),
+        linear-gradient(180deg, #020617 0%, #0f172a 60%, #111827 100%);
+      color: var(--text);
+      padding: 24px;
+    }
+
+    .layout {
+      max-width: 1100px;
+      margin: 0 auto;
+      display: grid;
+      gap: 20px;
+      grid-template-columns: 320px minmax(0, 1fr);
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      backdrop-filter: blur(14px);
+      box-shadow: 0 18px 60px rgba(2, 6, 23, 0.35);
+    }
+
+    .controls {
+      padding: 20px;
+    }
+
+    h1 {
+      margin: 0 0 6px;
+      font-size: 28px;
+      letter-spacing: 0.04em;
+    }
+
+    p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    label {
+      display: block;
+      margin-top: 18px;
+      margin-bottom: 8px;
+      font-size: 14px;
+      color: var(--muted);
+    }
+
+    input {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(15, 23, 42, 0.55);
+      color: var(--text);
+      padding: 12px 14px;
+      font-size: 14px;
+    }
+
+    button {
+      width: 100%;
+      margin-top: 16px;
+      border: 0;
+      border-radius: 14px;
+      padding: 14px 16px;
+      font-size: 15px;
+      font-weight: 700;
+      color: #041014;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      cursor: pointer;
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      filter: grayscale(0.3);
+      opacity: 0.7;
+    }
+
+    .status {
+      margin-top: 16px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      background: rgba(15, 23, 42, 0.55);
+      border: 1px solid var(--line);
+      color: var(--muted);
+      min-height: 46px;
+    }
+
+    .viewer {
+      padding: 18px;
+      display: grid;
+      gap: 16px;
+    }
+
+    video {
+      width: 100%;
+      min-height: 420px;
+      border-radius: 18px;
+      background: #020617;
+      border: 1px solid var(--line);
+    }
+
+    pre {
+      margin: 0;
+      min-height: 180px;
+      max-height: 260px;
+      overflow: auto;
+      padding: 14px;
+      border-radius: 16px;
+      background: rgba(2, 6, 23, 0.88);
+      border: 1px solid var(--line);
+      color: #cbd5e1;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+    }
+
+    .error {
+      color: var(--error);
+    }
+
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; }
+      video { min-height: 260px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <section class="panel controls">
+      <h1>接收端</h1>
+      <p>先启动信令服务和 native 发送端，再在这里请求会话。</p>
+
+      <label for="serverUrl">信令地址</label>
+      <input id="serverUrl" value="ws://127.0.0.1:8000/server">
+
+      <label for="sessionId">会话 ID</label>
+      <input id="sessionId" value="demo-room">
+
+      <button id="startButton">连接并请求屏幕流</button>
+      <div id="status" class="status">未连接</div>
+    </section>
+
+    <section class="panel viewer">
+      <video id="remoteVideo" autoplay playsinline controls></video>
+      <pre id="logs"></pre>
+    </section>
+  </div>
+
+  <script>
+    const startButton = document.getElementById('startButton');
+    const statusEl = document.getElementById('status');
+    const logsEl = document.getElementById('logs');
+    const remoteVideo = document.getElementById('remoteVideo');
+    const serverUrlInput = document.getElementById('serverUrl');
+    const sessionIdInput = document.getElementById('sessionId');
+
+    let ws;
+    let pc;
+    let remoteStream;
+    let requestedSessionId = '';
+    const pendingCandidates = [];
+
+    const ensureVideoPlayback = async () => {
+      try {
+        await remoteVideo.play();
+      } catch (error) {
+        log(`视频播放等待用户手势: ${error.message}`, true);
+      }
+    };
+
+    const log = (message, isError = false) => {
+      const line = `[${new Date().toLocaleTimeString()}] ${message}`;
+      logsEl.textContent += `${line}\n`;
+      logsEl.scrollTop = logsEl.scrollHeight;
+      statusEl.textContent = message;
+      statusEl.classList.toggle('error', isError);
+    };
+
+    const createPeerConnection = () => {
+      const config = {
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      };
+
+      pc = new RTCPeerConnection(config);
+      remoteStream = new MediaStream();
+      remoteVideo.srcObject = remoteStream;
+      remoteVideo.onloadedmetadata = () => {
+        log(`远端视频尺寸: ${remoteVideo.videoWidth}x${remoteVideo.videoHeight}`);
+        ensureVideoPlayback();
+      };
+
+      pc.ontrack = (event) => {
+        if (event.streams && event.streams.length > 0) {
+          event.streams[0].getTracks().forEach((track) => remoteStream.addTrack(track));
+        } else if (event.track) {
+          remoteStream.addTrack(event.track);
+        }
+        if (event.track) {
+          event.track.onunmute = () => ensureVideoPlayback();
+        }
+        ensureVideoPlayback();
+        log(`收到远端 ${event.track.kind} 轨道`);
+      };
+
+      pc.onicecandidate = (event) => {
+        if (!event.candidate || !ws || ws.readyState !== WebSocket.OPEN) {
+          return;
+        }
+        ws.send(JSON.stringify({
+          type: 'candidate',
+          candidate: event.candidate.candidate,
+          sdpMid: event.candidate.sdpMid,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
+          id: requestedSessionId
+        }));
+      };
+
+      pc.onconnectionstatechange = () => {
+        log(`PeerConnection 状态: ${pc.connectionState}`);
+      };
+    };
+
+    const applyPendingCandidates = async () => {
+      while (pendingCandidates.length) {
+        const candidate = pendingCandidates.shift();
+        await pc.addIceCandidate(candidate);
+      }
+    };
+
+    const onOffer = async (message) => {
+      if (!pc) {
+        createPeerConnection();
+      }
+
+      await pc.setRemoteDescription({ type: 'offer', sdp: message.sdp });
+      await applyPendingCandidates();
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      ws.send(JSON.stringify({
+        type: 'answer',
+        sdp: answer.sdp,
+        id: requestedSessionId
+      }));
+
+      log('已发送 answer，等待连通');
+    };
+
+    const onCandidate = async (message) => {
+      const candidate = new RTCIceCandidate({
+        candidate: message.candidate,
+        sdpMid: message.sdpMid,
+        sdpMLineIndex: message.sdpMLineIndex
+      });
+
+      if (!pc || !pc.remoteDescription) {
+        pendingCandidates.push(candidate);
+        return;
+      }
+
+      await pc.addIceCandidate(candidate);
+    };
+
+    startButton.addEventListener('click', () => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        return;
+      }
+
+      pendingCandidates.length = 0;
+      if (pc) {
+        pc.close();
+        pc = null;
+      }
+      if (remoteStream) {
+        remoteStream.getTracks().forEach((track) => track.stop());
+      }
+      remoteVideo.srcObject = null;
+
+      requestedSessionId = sessionIdInput.value.trim();
+      if (!requestedSessionId) {
+        log('会话 ID 不能为空', true);
+        return;
+      }
+
+      createPeerConnection();
+      ws = new WebSocket(serverUrlInput.value.trim());
+
+      ws.onopen = () => {
+        startButton.disabled = true;
+        ws.send(JSON.stringify({ type: 'request', id: requestedSessionId }));
+        log(`已连接信令，已发送 request: ${requestedSessionId}`);
+      };
+
+      ws.onmessage = async (event) => {
+        const message = JSON.parse(event.data);
+        if (message.type === 'offer') {
+          await onOffer(message);
+          return;
+        }
+        if (message.type === 'candidate') {
+          await onCandidate(message);
+          return;
+        }
+        if (message.type === 'peer-disconnected') {
+          log('对端已断开', true);
+          return;
+        }
+        if (message.type === 'error') {
+          log(`信令错误: ${message.message}`, true);
+          startButton.disabled = false;
+          return;
+        }
+
+        log(`收到未处理消息: ${event.data}`);
+      };
+
+      ws.onclose = () => {
+        startButton.disabled = false;
+        log('信令连接关闭', true);
+      };
+
+      ws.onerror = () => {
+        log('信令连接失败', true);
+      };
+    });
+  </script>
+</body>
+</html>
