@@ -2,6 +2,7 @@
 
 #include <QDebug>
 
+// 构造时立即建立连接，并把底层状态事件统一转成当前类对外暴露的信号。
 WebsocketClient::WebsocketClient(const QUrl &url, QObject *parent)
 : QObject(parent), m_url(url)
 {
@@ -14,6 +15,7 @@ WebsocketClient::WebsocketClient(const QUrl &url, QObject *parent)
 
 void WebsocketClient::sendMessage(const QString &message)
 {
+    // 当前封装只处理文本协议，适合 JSON 信令这类轻量消息。
     m_webSocket.sendTextMessage(message);
 }
 
@@ -31,6 +33,7 @@ void WebsocketClient::onDisconnected()
 
 void WebsocketClient::onTextMessageReceived(const QString &message)
 {
+    // 保留原始文本，解析职责交给更高一层的信令模块处理。
     qDebug() << "Message received:" << message;
     emit messageReceived(message);
 }

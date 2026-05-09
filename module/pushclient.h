@@ -32,6 +32,7 @@
 // 如果需要窗口捕获：#include "modules/desktop_capture/window_capturer.h"
 // 如果需要窗口捕获：#include "modules/desktop_capture/window_capturer.h"
 
+// ICE 服务配置：由业务层决定是否注入 STUN/TURN 地址。
 struct IceServerConfig
 {
     std::string uri;      // e.g. "stun:stun.l.google.com:19302" or "turn:your.turn.server:3478?transport=tcp"
@@ -53,6 +54,7 @@ struct IceCandidateBundle
     std::string id;
 };
 
+// 轻量信令抽象：WebRTCPushClient 不直接依赖具体网络层，而是通过回调把 SDP/ICE 交给上层发送。
 class SimpleSignaling
 {
 public:
@@ -61,6 +63,9 @@ public:
     std::function<void(const IceCandidateBundle &)> onLocalIce;
 };
 
+// 基于 DesktopCapturer 的桌面源实现。
+// 当前工程主要使用 CapturerTrackSource，但该类保留了 AdaptedVideoTrackSource 版本的封装，
+// 便于后续切换到另一套视频源接入方式。
 class DesktopCapturerSource : public webrtc::AdaptedVideoTrackSource,
                               public webrtc::DesktopCapturer::Callback
 {
@@ -90,6 +95,7 @@ private:
     void CaptureLoop();
 
 private:
+    // 底层桌面捕获器以及驱动它的后台线程。
     std::unique_ptr<webrtc::DesktopCapturer> capturer_;
     std::unique_ptr<std::thread> capture_thread_;
     std::atomic<bool> is_running_;
@@ -97,6 +103,8 @@ private:
     int fps_;
 };
 
+// WebRTC VideoTrackSource 实现：
+// 负责把桌面帧采集出来，转换为 VideoFrame 后广播给 PeerConnection 中的视频轨。
 class CapturerTrackSource : public webrtc::VideoTrackSource
 {
 public:
@@ -112,12 +120,14 @@ public:
 public:
     CapturerTrackSource();
 
+    // 被采集线程调用，把新帧广播到所有 sink。
     void OnCapturedFrame(const webrtc::VideoFrame &frame)
     {
         broadcaster_.OnFrame(frame);
     }
 
 
+    // 启动独立采集线程，持续从桌面捕获器拉取帧。
     void Start();
 protected:
     // VideoTrackSource 接口
@@ -139,6 +149,7 @@ protected:
     }
 
 private:
+    // 真正执行桌面抓取和像素转换的循环。
     void StartCaptureLoop(int target_fps, bool capture_cursor);
 
     std::unique_ptr<webrtc::DesktopCapturer> capturer_;
@@ -158,6 +169,7 @@ public:
 
 class WebRTCPushClient;
 
+// PeerConnection 观察者：负责接收连接状态和本地 ICE 事件，并回调到业务层。
 class PeerObserver : public webrtc::PeerConnectionObserver
 {
 public:
@@ -202,9 +214,14 @@ private:
     std::string owner_id_;
 };
 
+// 原生桌面推流客户端：
+// 1. 创建 PeerConnectionFactory 和 PeerConnection。
+// 2. 建立桌面视频轨并发起 offer。
+// 3. 处理 answer/ICE，并提供发送 RTP 的诊断能力。
 class WebRTCPushClient
 {
 public:
+    // 预检当前运行环境是否具备桌面采集能力。
     static bool IsDesktopCaptureAvailable();
 
     WebRTCPushClient(std::string id);
@@ -236,11 +253,14 @@ public:
     void StopRtpSendStatsPolling();
     bool IsSendingRtpVideo() const { return is_sending_rtp_video_.load(); }
 
+    // 对外暴露的信令回调集合，由 SignalingClient 绑定到 WebSocket 发送逻辑。
     SimpleSignaling signaling;
 
 private:
+    // 懒初始化桌面采集源，避免在 WebRTC 工厂尚未就绪时提前占用资源。
     bool PrepareDesktopVideoSource(int fps);
 
+    // PeerConnection 及其相关媒体对象。
     webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc_;
     webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory_;
     webrtc::scoped_refptr<webrtc::VideoTrackInterface> video_track_;
@@ -251,12 +271,13 @@ private:
 
     std::unique_ptr<PeerObserver> observer_;
 
+    // WebRTC 线程模型要求的网络/工作/信令线程。
     std::unique_ptr<webrtc::Thread> network_thread_;
     std::unique_ptr<webrtc::Thread> worker_thread_;
     std::unique_ptr<webrtc::Thread> signaling_thread_;
     std::string id{""};
 
-    // --- RTP 发送诊断 ---
+    // RTP 发送诊断状态：通过周期性读取 stats 判断视频是否真正发出。
     std::atomic<bool> stats_polling_{false};
     std::unique_ptr<std::thread> stats_thread_;
     std::atomic<bool> is_sending_rtp_video_{false};

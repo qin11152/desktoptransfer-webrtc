@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+// 初始化信令客户端时只做信号绑定，不主动联网；真正连接由 connectToServer 触发。
 SignalingClient::SignalingClient(QObject *parent)
     : QObject(parent)
 {
@@ -14,12 +15,14 @@ SignalingClient::SignalingClient(QObject *parent)
 
 void SignalingClient::connectToServer(const QString &url)
 {
+    // Sender 侧始终通过单条 WebSocket 和服务端交互，所有会话消息都复用这条连接。
     qDebug() << "Connecting to signaling server:" << url;
     m_webSocket.open(QUrl(url));
 }
 
 void SignalingClient::onConnected()
 {
+    // 告知信令服务器当前连接可被分配为发送端。
     qDebug() << "Signaling connected!";
     QJsonObject json;
     json["type"] = "sender-ready";
@@ -28,7 +31,7 @@ void SignalingClient::onConnected()
 
 void SignalingClient::onTextMessageReceived(const QString &message)
 {
-
+    // 信令报文采用 JSON 文本协议，这里先解析出 type/id，再路由到具体的 WebRTC 会话。
     nlohmann::json j;
     try {
         j = nlohmann::json::parse(message.toUtf8().constData());
@@ -38,7 +41,7 @@ void SignalingClient::onTextMessageReceived(const QString &message)
         return;
     }
 
-    // 2. 取出 type 和 sdp
+    // 每条消息至少依赖 type 和 id 完成路由；sdp/candidate 等字段按具体消息类型读取。
     std::string type = j.value("type", "");
     std::string sdp  = j.value("sdp", "");
     std::string id   = j.value("id", "");
@@ -58,6 +61,7 @@ void SignalingClient::onTextMessageReceived(const QString &message)
 
     if (type == "answer")
     {
+        // 接收端返回 answer 后，交给对应会话继续完成协商。
         std::string sdp = j.value("sdp", "");
         auto jt = clients.find(id);
         if (jt != clients.end())
@@ -68,6 +72,7 @@ void SignalingClient::onTextMessageReceived(const QString &message)
     }
     else if (type == "request")
     {
+        // request 表示某个接收端请求开始一个新的桌面推流会话。
         if (!WebRTCPushClient::IsDesktopCaptureAvailable())
         {
             QJsonObject json;
@@ -81,6 +86,8 @@ void SignalingClient::onTextMessageReceived(const QString &message)
         auto client = std::make_shared<WebRTCPushClient>(id);
         std::vector<IceServerConfig> iceServers = {
             {"stun:stun.l.google.com:19302", "", ""}};
+
+        // 必须先挂好回调，再执行 Init；否则首次 offer/candidate 可能在初始化过程中丢失。
         setupCallbacks(client);
         if (!client->Init(iceServers))
         {
@@ -96,6 +103,7 @@ void SignalingClient::onTextMessageReceived(const QString &message)
     }
     else if (type == "candidate")
     {
+        // 远端 ICE 候选按会话 id 转发到对应的 PeerConnection。
         std::string candidate = j.value("candidate", "");
         std::string sdpMid = j.value("sdpMid", "");
         int sdpMLineIndex = j.value("sdpMLineIndex", 0);
@@ -119,11 +127,10 @@ void SignalingClient::onDisconnected()
 
 void SignalingClient::setupCallbacks(std::shared_ptr<WebRTCPushClient> rtcClient)
 {
-    // 1. 当 WebRTC 生成本地 Offer 时，通过 WebSocket 发送
+    // 绑定 WebRTC -> 信令通道：把底层协商事件封装成 JSON，再切回 Qt 线程发送。
     rtcClient->signaling.onLocalSdp = [this](const SdpBundle &bundle, std::string id)
     {
-        // 注意：这里是在 WebRTC 线程回调的，建议通过 Qt 的信号槽或 invokeMethod 转到主线程发送
-        // 简单起见，QWebSocket 是线程安全的（write 操作），但最好用 QMetaObject::invokeMethod
+        // 该回调可能来自 WebRTC 内部线程，使用 invokeMethod 避免直接跨线程操作 QWebSocket。
         QJsonObject json;
         json["type"] = QString::fromStdString(bundle.type); // "offer"
         json["sdp"] = QString::fromStdString(bundle.sdp);
@@ -133,7 +140,7 @@ void SignalingClient::setupCallbacks(std::shared_ptr<WebRTCPushClient> rtcClient
                                   { sendJson(json); });
     };
 
-    // 2. 当 WebRTC 收集到本地 ICE 时，通过 WebSocket 发送
+    // 本地 ICE 候选收集到后同样转成信令消息发给接收端。
     rtcClient->signaling.onLocalIce = [this](const IceCandidateBundle &ice)
     {
         QJsonObject json;
@@ -150,6 +157,7 @@ void SignalingClient::setupCallbacks(std::shared_ptr<WebRTCPushClient> rtcClient
 
 void SignalingClient::sendJson(const QJsonObject &json)
 {
+    // 统一使用紧凑 JSON，便于日志查看和浏览器端直接解析。
     if (m_webSocket.isValid())
     {
         QJsonDocument doc(json);

@@ -170,6 +170,10 @@
   </div>
 
   <script>
+    // 浏览器接收端职责：
+    // 1. 通过 WebSocket 向信令服务发送 request。
+    // 2. 接收 native sender 发来的 offer/ICE。
+    // 3. 完成 answer 应答并把远端媒体渲染到 video 元素上。
     const startButton = document.getElementById('startButton');
     const statusEl = document.getElementById('status');
     const logsEl = document.getElementById('logs');
@@ -183,6 +187,7 @@
     let requestedSessionId = '';
     const pendingCandidates = [];
 
+    // 浏览器自动播放可能被策略拦截，这里在流真正到达时重复尝试播放。
     const ensureVideoPlayback = async () => {
       try {
         await remoteVideo.play();
@@ -199,6 +204,7 @@
       statusEl.classList.toggle('error', isError);
     };
 
+    // 每次发起新会话前重建 PeerConnection，避免上一次连接状态残留。
     const createPeerConnection = () => {
       const config = {
         iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
@@ -213,6 +219,7 @@
       };
 
       pc.ontrack = (event) => {
+        // 优先使用浏览器提供的 MediaStream；若为空则退化到逐轨道组装。
         if (event.streams && event.streams.length > 0) {
           event.streams[0].getTracks().forEach((track) => remoteStream.addTrack(track));
         } else if (event.track) {
@@ -226,6 +233,7 @@
       };
 
       pc.onicecandidate = (event) => {
+        // 把浏览器侧本地 ICE 回传给 native sender，补全双向 ICE 协商。
         if (!event.candidate || !ws || ws.readyState !== WebSocket.OPEN) {
           return;
         }
@@ -243,6 +251,7 @@
       };
     };
 
+    // 在 remoteDescription 尚未设置前收到的 ICE 先缓存，避免 addIceCandidate 时机错误。
     const applyPendingCandidates = async () => {
       while (pendingCandidates.length) {
         const candidate = pendingCandidates.shift();
@@ -255,6 +264,7 @@
         createPeerConnection();
       }
 
+      // 先应用远端 offer，再把之前缓存的 ICE 候选补进去，最后生成 answer。
       await pc.setRemoteDescription({ type: 'offer', sdp: message.sdp });
       await applyPendingCandidates();
 
@@ -278,6 +288,7 @@
       });
 
       if (!pc || !pc.remoteDescription) {
+        // 浏览器侧还没完成 setRemoteDescription 时，先缓存候选。
         pendingCandidates.push(candidate);
         return;
       }
@@ -290,6 +301,7 @@
         return;
       }
 
+      // 每次重新请求会话前清空旧的连接状态和缓存。
       pendingCandidates.length = 0;
       if (pc) {
         pc.close();
@@ -310,12 +322,14 @@
       ws = new WebSocket(serverUrlInput.value.trim());
 
       ws.onopen = () => {
+        // receiver 通过 request 指定会话 id，信令服务再为其分配一个空闲 sender。
         startButton.disabled = true;
         ws.send(JSON.stringify({ type: 'request', id: requestedSessionId }));
         log(`已连接信令，已发送 request: ${requestedSessionId}`);
       };
 
       ws.onmessage = async (event) => {
+        // 当前浏览器端只消费 offer/candidate/error/peer-disconnected 这几类消息。
         const message = JSON.parse(event.data);
         if (message.type === 'offer') {
           await onOffer(message);

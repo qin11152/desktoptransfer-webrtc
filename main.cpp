@@ -29,12 +29,19 @@
 #endif
 #include <thread>
 #include <fstream>
+
+// 应用入口：
+// 1. 初始化 SSL 与平台运行时。
+// 2. 根据命令行决定进入无界面自启动模式，还是显示 Qt 控制窗口。
+// 3. 在无界面模式下直接连到信令服务器等待 request；在界面模式下由 widg 触发连接。
 namespace
 {
 
 bool InitializePlatformRuntime(bool autostart)
 {
 #if defined(TWEBRTC_PLATFORM_LINUX)
+  // 在 Linux 下优先根据当前桌面环境选择合适的 Qt 平台插件。
+  // Wayland 会优先尝试使用 Qt Wayland 插件；X11 路径则需要先初始化 Xlib 线程支持。
   const QByteArray sessionType = qgetenv("XDG_SESSION_TYPE");
   const QByteArray waylandDisplay = qgetenv("WAYLAND_DISPLAY");
   if (!autostart && qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM") &&
@@ -84,6 +91,7 @@ int main(int argc, char *argv[])
 #endif
 
 #if 1
+  // 无界面模式通常用于桌面环境自启动：进程启动后直接注册为 sender 并等待接收端请求。
   bool autostart = false;
   for (int index = 1; index < argc; ++index)
   {
@@ -113,6 +121,7 @@ int main(int argc, char *argv[])
 
   if (autostart)
   {
+    // 无界面模式仅保留 Qt 事件循环和信令客户端，不创建窗口。
     QCoreApplication app(argc, argv);
     SignalingClient signalingClient;
     signalingClient.connectToServer("ws://localhost:8000/server");
@@ -124,6 +133,7 @@ int main(int argc, char *argv[])
 
   QApplication app(argc, argv);
 
+  // 普通模式通过控制窗口启动信令连接，便于人工操作和调试。
   widg window(false);
   window.show();
 

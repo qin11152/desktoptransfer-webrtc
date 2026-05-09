@@ -7,12 +7,18 @@
 #include <QWebSocket>
 #include <QWebSocketServer>
 
+// 一个会话绑定一对 sender/receiver 套接字。
+// 服务端只做路由，不理解 SDP 和 ICE 的业务内容。
 struct SessionBinding
 {
     QPointer<QWebSocket> sender;
     QPointer<QWebSocket> receiver;
 };
 
+// 最小信令服务：
+// 1. sender 连接后发送 sender-ready 表示自己可用。
+// 2. receiver 发送 request 后，服务端挑一个空闲 sender 建立会话绑定。
+// 3. offer/answer/candidate/error 等消息按会话 id 在双方之间转发。
 class SignalingServer : public QObject
 {
     Q_OBJECT
@@ -34,6 +40,7 @@ public:
 private:
     void onNewConnection()
     {
+        // 每个新连接注册消息和断开回调，后续所有会话都依赖这条长连接承载。
         auto *socket = server_.nextPendingConnection();
         if (!socket)
             return;
@@ -49,6 +56,7 @@ private:
 
     void onTextMessage(QWebSocket *socket, const QString &message)
     {
+        // 服务端只处理一层 JSON 包装，再根据 type 决定路由方式。
         QJsonParseError error;
         const auto document = QJsonDocument::fromJson(message.toUtf8(), &error);
         if (error.error != QJsonParseError::NoError || !document.isObject())
@@ -63,6 +71,7 @@ private:
 
         if (type == QStringLiteral("sender-ready"))
         {
+            // sender-ready 仅表示该连接可被分配，不会立即创建会话。
             ready_senders_.insert(socket);
             qInfo() << "Sender ready" << socket;
             return;
@@ -85,6 +94,7 @@ private:
 
     void handleRequest(QWebSocket *receiver, const QJsonObject &json, const QString &id)
     {
+        // request 由 receiver 发起；服务端负责挑选一个尚未被占用的 sender。
         if (id.isEmpty())
         {
             sendError(receiver, QStringLiteral("request missing id"));
@@ -100,6 +110,7 @@ private:
         QWebSocket *selected_sender = nullptr;
         for (auto *candidate : ready_senders_)
         {
+            // 一个 sender 在当前实现中同一时刻只承载一个会话。
             if (candidate && candidate != receiver && !socket_to_session_.contains(candidate))
             {
                 selected_sender = candidate;
@@ -126,6 +137,7 @@ private:
 
     void forwardSessionMessage(QWebSocket *socket, const QJsonObject &json, const QString &id)
     {
+        // 已建立会话后，offer/answer/candidate 等消息只按 id 透传给对端。
         if (id.isEmpty() || !sessions_.contains(id))
         {
             sendError(socket, QStringLiteral("unknown session id: ") + id);
@@ -154,6 +166,7 @@ private:
 
     void onDisconnected(QWebSocket *socket)
     {
+        // 任一侧断开后，清理会话映射并通知仍在线的对端结束当前会话。
         qInfo() << "Client disconnected" << socket;
         ready_senders_.remove(socket);
         sockets_.remove(socket);
@@ -181,6 +194,7 @@ private:
 
     void sendPeerDisconnected(QWebSocket *socket, const QString &id)
     {
+        // 告知浏览器或原生 sender：本次会话对应的对端已离线。
         QJsonObject json;
         json[QStringLiteral("type")] = QStringLiteral("peer-disconnected");
         json[QStringLiteral("id")] = id;
@@ -214,6 +228,7 @@ private:
 
 int main(int argc, char *argv[])
 {
+    // 独立信令服务进程，仅运行 Qt 事件循环即可。
     QCoreApplication app(argc, argv);
     SignalingServer server(8000);
     return app.exec();

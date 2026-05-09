@@ -38,6 +38,8 @@
 
 namespace {
 
+// 判定当前 Linux 会话是否更接近 Wayland 语义。
+// 这会影响是否启用 PipeWire，以及使用哪类桌面捕获后端。
 bool IsWaylandSession()
 {
 #if defined(TWEBRTC_PLATFORM_LINUX)
@@ -68,6 +70,7 @@ bool IsWaylandSession()
 #endif
 }
 
+// 按平台调整桌面捕获选项，尽量启用当前环境支持的最佳后端。
 void ApplyPlatformCaptureOptions(webrtc::DesktopCaptureOptions& options)
 {
 #if defined(TWEBRTC_PLATFORM_LINUX)
@@ -99,6 +102,7 @@ void ApplyPlatformCaptureOptions(webrtc::DesktopCaptureOptions& options)
 #endif
 }
 
+// 统一创建桌面捕获配置，并在需要时打印运行环境提醒。
 webrtc::DesktopCaptureOptions CreateCaptureOptions()
 {
     auto options = webrtc::DesktopCaptureOptions::CreateDefault();
@@ -113,6 +117,7 @@ webrtc::DesktopCaptureOptions CreateCaptureOptions()
     return options;
 }
 
+// 创建屏幕捕获器；Wayland 下要求 WebRTC 构建时已启用 PipeWire。
 std::unique_ptr<webrtc::DesktopCapturer> CreatePlatformScreenCapturer()
 {
     if (IsWaylandSession())
@@ -132,6 +137,7 @@ std::unique_ptr<webrtc::DesktopCapturer> CreatePlatformScreenCapturer()
     return capturer;
 }
 
+// 创建窗口捕获器，目前主要保留给后续扩展使用。
 std::unique_ptr<webrtc::DesktopCapturer> CreatePlatformWindowCapturer()
 {
     if (IsWaylandSession())
@@ -151,6 +157,7 @@ std::unique_ptr<webrtc::DesktopCapturer> CreatePlatformWindowCapturer()
     return capturer;
 }
 
+// 多数桌面捕获后端要求先选定一个源；当前策略是默认选列表中的第一个。
 bool SelectDefaultSourceIfNeeded(webrtc::DesktopCapturer* capturer)
 {
     if (!capturer)
@@ -183,7 +190,7 @@ bool SelectDefaultSourceIfNeeded(webrtc::DesktopCapturer* capturer)
 
 } // namespace
 
-// 简化版 Observer 实现：CreateSessionDescriptionObserver/SetSessionDescriptionObserver
+// 简化版 observer：用 lambda 承接 Create/SetDescription 的异步回调，避免单独写样板类文件。
 namespace webrtc
 {
     class CreateSessionDescriptionObserverq : public webrtc::CreateSessionDescriptionObserver
@@ -211,6 +218,7 @@ namespace webrtc
 
 webrtc::scoped_refptr<CapturerTrackSource> CapturerTrackSource::Create(int target_fps, bool capture_cursor)
 {
+    // 创建桌面采集源时先完成捕获器和源选择，失败则直接返回空指针。
     auto src = webrtc::make_ref_counted<CapturerTrackSource>();
     src->m_iTargetFps = target_fps;
     src->capturer_ = CreatePlatformScreenCapturer();
@@ -235,6 +243,7 @@ CapturerTrackSource::CapturerTrackSource()
 
 void CapturerTrackSource::Start()
 {
+    // 桌面抓取放在独立线程中执行，避免阻塞 WebRTC 信令和 Qt 主线程。
     running_ = true;
     cap_thread_ = std::thread([this]()
                               { StartCaptureLoop(m_iTargetFps, true); });
@@ -257,16 +266,17 @@ void CapturerTrackSource::StartCaptureLoop(int target_fps, bool capture_cursor)
         {
             if (result != webrtc::DesktopCapturer::Result::SUCCESS || !frame)
                 return;
+
             // 将 DesktopFrame 转为 I420 VideoFrame
             int width = frame->size().width();
             int height = frame->size().height();
 
-            // DesktopFrame 为 BGRA，简单起见用 libyuv 做转换（libwebrtc 已内置）
+            // DesktopFrame 常见格式为 BGRA，这里使用 libyuv 转成 WebRTC 编码链更常见的 I420。
             webrtc::scoped_refptr<webrtc::I420Buffer> i420 = webrtc::I420Buffer::Create(width, height);
             const uint8_t *src_bgra = frame->data();
             int src_stride_bgra = frame->stride();
 
-            // BGRA -> I420
+            // BGRA -> I420。这里没有额外缩放，直接保持桌面原始尺寸。
             libyuv::ARGBToI420(src_bgra, src_stride_bgra,
                                i420->MutableDataY(), i420->StrideY(),
                                i420->MutableDataU(), i420->StrideU(),
@@ -336,6 +346,8 @@ void DesktopCapturerSource::Start()
 {
     if (is_running_)
         return;
+
+    // 该版本的视频源通过轮询 CaptureFrame 触发回调。
     is_running_ = true;
     capture_thread_.reset(new std::thread(&DesktopCapturerSource::CaptureLoop, this));
 }
@@ -373,6 +385,7 @@ void DesktopCapturerSource::CaptureLoop()
 
 bool WebRTCPushClient::IsDesktopCaptureAvailable()
 {
+    // 使用“能否创建并选中默认源”作为环境可用性的最小判断标准。
     auto capturer = CreatePlatformScreenCapturer();
     if (!capturer)
     {
@@ -385,6 +398,7 @@ bool WebRTCPushClient::IsDesktopCaptureAvailable()
 WebRTCPushClient::WebRTCPushClient(std::string id)
     : id{id}
 {
+    // WebRTC 要求显式准备网络、工作和信令线程；后续工厂和 PeerConnection 都复用它们。
     network_thread_ = webrtc::Thread::CreateWithSocketServer();
     worker_thread_ = webrtc::Thread::Create();
     signaling_thread_ = webrtc::Thread::CreateWithSocketServer();
@@ -415,6 +429,7 @@ WebRTCPushClient::~WebRTCPushClient()
 
 bool WebRTCPushClient::Init(const std::vector<IceServerConfig> &ice_servers)
 {
+    // 先验证桌面采集源，再创建工厂和 PeerConnection，避免连上信令后才发现无法抓屏。
     if (!PrepareDesktopVideoSource(30))
     {
         return false;
@@ -466,16 +481,14 @@ bool WebRTCPushClient::Init(const std::vector<IceServerConfig> &ice_servers)
         config.servers.push_back(stun);
     }
 
-    // 2) 候选过滤与传输类型
-    // 仅收集/使用某些类型的候选（可选）：
+    // 候选传输策略：当前允许所有类型候选，以便在局域网、公网和 TURN 场景下都能工作。
     config.type = webrtc::PeerConnectionInterface::IceTransportsType::kAll;
-    // 可改为 kRelay（只走 TURN），kNone（禁用）等
 
-    // 3) 持续收集策略（如果你想水位更稳定，或长期收集）：
+    // 持续收集策略：连接存活期间持续上报新候选，适合网络切换或后续补齐链路。
     config.continual_gathering_policy =
         webrtc::PeerConnectionInterface::ContinualGatheringPolicy::GATHER_CONTINUALLY;
 
-    // 4) 网络相关（根据需要开启/关闭 IPv6、网关选择等）
+    // 网络相关附加策略。
     config.disable_ipv6_on_wifi = false;
 
     observer_ = std::make_unique<PeerObserver>(&signaling, this, id);
@@ -504,6 +517,7 @@ bool WebRTCPushClient::PrepareDesktopVideoSource(int fps)
 {
     if (capture_source_)
     {
+        // 已创建过时直接复用，避免重复启动捕获器。
         return true;
     }
 
@@ -522,6 +536,7 @@ bool WebRTCPushClient::AddLocalAudio()
     if (!factory_ || !pc_)
         return false;
 
+    // 当前默认使用 dummy ADM，因此这里只演示音频轨创建流程，未接入真实桌面音频采集后端。
     webrtc::AudioOptions options;
     auto audio_source = factory_->CreateAudioSource(options);
     if (!audio_source)
@@ -556,6 +571,7 @@ bool WebRTCPushClient::AddDesktopVideo(int fps, int max_bitrate_bps)
     if (!factory_ || !pc_)
         return false;
 
+    // 视频轨是在 PeerConnection 创建成功后补进去的，随后会生成 sendonly transceiver。
     if (!PrepareDesktopVideoSource(fps))
     {
         RTC_LOG(LS_ERROR) << "Failed to initialize desktop video source";
@@ -581,7 +597,7 @@ bool WebRTCPushClient::AddDesktopVideo(int fps, int max_bitrate_bps)
     auto transceiver = transceiver_or.value();
     video_sender_ = transceiver->sender();
 
-    // 设置码率上限
+    // 设置编码器初始码率上限，避免桌面流默认码率过高。
     if (max_bitrate_bps > 0)
     {
         webrtc::RtpParameters params = video_sender_->GetParameters();
@@ -601,6 +617,7 @@ bool WebRTCPushClient::CreateAndSendOffer(bool ice_restart)
     if (!pc_)
         return false;
 
+    // 打印当前协商状态，便于排查在错误时机重复发 offer 的问题。
     RTC_LOG(LS_INFO) << "CreateAndSendOffer signaling_state=" << pc_->signaling_state()
                      << ", local_description=" << (pc_->local_description() ? "set" : "null")
                      << ", remote_description=" << (pc_->remote_description() ? "set" : "null")
@@ -614,6 +631,7 @@ bool WebRTCPushClient::CreateAndSendOffer(bool ice_restart)
         new webrtc::RefCountedObject<webrtc::CreateSessionDescriptionObserverq>(
             [this](webrtc::SessionDescriptionInterface *desc)
             {
+                // 创建 offer 成功后先设为本地描述，再通过业务层信令回调发给接收端。
                 pc_->SetLocalDescription(
                     new webrtc::RefCountedObject<webrtc::SetSessionDescriptionObserverq>(),
                     desc);
@@ -638,6 +656,7 @@ bool WebRTCPushClient::SetRemoteAnswer(const std::string &sdp_answer)
     if (!pc_)
         return false;
 
+    // Sender 侧只接受 answer；offer/rollback 等其他 SDP 类型不在当前流程内处理。
     auto desc = webrtc::CreateSessionDescription(webrtc::SdpType::kAnswer, sdp_answer);
     if (!desc)
     {
@@ -655,6 +674,7 @@ bool WebRTCPushClient::AddRemoteIce(const std::string &candidate_sdp, int sdp_ml
     if (!pc_)
         return false;
 
+    // 浏览器有时会带上 a= 前缀，这里做一次归一化，便于统一走 ParseCandidateString。
     std::string normalized_candidate = candidate_sdp;
     if (normalized_candidate.rfind("a=", 0) == 0)
     {
@@ -699,6 +719,7 @@ void WebRTCPushClient::StartRtpSendStatsPolling(int interval_ms)
         return; // already running
     }
 
+    // 清空上一次会话的计数，确保新连接的发送状态判断准确。
     is_sending_rtp_video_.store(false);
     last_video_bytes_sent_.store(0);
     last_video_packets_sent_.store(0);
@@ -728,7 +749,7 @@ void WebRTCPushClient::PollRtpSendStatsOnce()
     if (!pc_)
         return;
 
-    // 未连接时没必要判定 RTP
+    // 连接未建立时无需轮询 outbound-rtp，避免把协商前阶段误判成发送异常。
     if (pc_->peer_connection_state() != webrtc::PeerConnectionInterface::PeerConnectionState::kConnected)
     {
         is_sending_rtp_video_.store(false);
@@ -748,7 +769,7 @@ void WebRTCPushClient::PollRtpSendStatsOnce()
             uint64_t best_packets_sent = 0;
             bool found_video_outbound = false;
 
-            // 强类型遍历 outbound-rtp
+            // 遍历所有视频 outbound-rtp 统计，选 bytesSent 最大的一路作为当前主发送流。
             for (const webrtc::RTCOutboundRtpStreamStats *s : report->GetStatsOfType<webrtc::RTCOutboundRtpStreamStats>())
             {
                 if (!s || !s->kind || *s->kind != "video")
@@ -797,6 +818,8 @@ void PeerObserver::OnConnectionChange(webrtc::PeerConnectionInterface::PeerConne
     RTC_LOG(LS_INFO) << "PeerConnection state: " << new_state;
     if (!owner_)
         return;
+
+    // 连接建立后开始轮询发送统计；链路断开或关闭后立刻停掉后台线程。
     if (new_state == webrtc::PeerConnectionInterface::PeerConnectionState::kConnected)
     {
         owner_->StartRtpSendStatsPolling(1000);
