@@ -40,6 +40,7 @@ namespace {
 
 bool IsWaylandSession()
 {
+#if defined(TWEBRTC_PLATFORM_LINUX)
     const char* qt_platform = std::getenv("QT_QPA_PLATFORM");
     if (qt_platform && std::string(qt_platform).rfind("xcb", 0) == 0)
     {
@@ -62,12 +63,14 @@ bool IsWaylandSession()
 
     const char* wayland_display = std::getenv("WAYLAND_DISPLAY");
     return wayland_display && *wayland_display;
+#else
+    return false;
+#endif
 }
 
-webrtc::DesktopCaptureOptions CreateCaptureOptions()
+void ApplyPlatformCaptureOptions(webrtc::DesktopCaptureOptions& options)
 {
-    auto options = webrtc::DesktopCaptureOptions::CreateDefault();
-
+#if defined(TWEBRTC_PLATFORM_LINUX)
 #if defined(WEBRTC_USE_X11)
     options.set_use_update_notifications(true);
     options.set_prefer_cursor_embedded(true);
@@ -80,7 +83,7 @@ webrtc::DesktopCaptureOptions CreateCaptureOptions()
         RTC_LOG(LS_INFO) << "Wayland session detected; enabling PipeWire desktop capture.";
     }
 #endif
-
+#elif defined(TWEBRTC_PLATFORM_WINDOWS)
 #if defined(WEBRTC_WIN)
     options.set_allow_directx_capturer(true);
 #if defined(RTC_ENABLE_WIN_WGC)
@@ -89,6 +92,18 @@ webrtc::DesktopCaptureOptions CreateCaptureOptions()
     options.set_allow_wgc_capturer_fallback(true);
 #endif
 #endif
+#elif defined(TWEBRTC_PLATFORM_MACOS)
+    RTC_LOG(LS_INFO) << "Using default macOS desktop capture options.";
+#else
+    RTC_LOG(LS_WARNING) << "Using default desktop capture options on an unverified platform.";
+#endif
+}
+
+webrtc::DesktopCaptureOptions CreateCaptureOptions()
+{
+    auto options = webrtc::DesktopCaptureOptions::CreateDefault();
+
+    ApplyPlatformCaptureOptions(options);
 
     if (IsWaylandSession())
     {

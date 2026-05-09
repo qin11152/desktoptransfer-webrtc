@@ -24,42 +24,55 @@
 #include "modules/desktop_capture/desktop_frame.h"
 #include "modules/desktop_capture/screen_capturer_helper.h"
 
-#if defined(Q_OS_LINUX)
+#if defined(TWEBRTC_PLATFORM_LINUX)
 #include <X11/Xlib.h>
 #endif
 #include <thread>
 #include <fstream>
-
-class MyDesktopCapturerCallback : public webrtc::DesktopCapturer::Callback
+namespace
 {
-public:
-  void OnFrameCaptureStart() override
+
+bool InitializePlatformRuntime(bool autostart)
+{
+#if defined(TWEBRTC_PLATFORM_LINUX)
+  const QByteArray sessionType = qgetenv("XDG_SESSION_TYPE");
+  const QByteArray waylandDisplay = qgetenv("WAYLAND_DISPLAY");
+  if (!autostart && qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM") &&
+      (sessionType == "wayland" || !waylandDisplay.isEmpty()))
   {
-    std::cout << "[Callback] Frame capture started" << std::endl;
+    const QString pluginRoot = qEnvironmentVariable("QT_PLUGIN_PATH");
+    const QFileInfo waylandPlugin(pluginRoot + "/platforms/libqwayland-generic.so");
+    if (waylandPlugin.exists())
+    {
+      qputenv("QT_QPA_PLATFORM", QByteArray("wayland"));
+    }
   }
 
-  void OnCaptureResult(webrtc::DesktopCapturer::Result result,
-                       std::unique_ptr<webrtc::DesktopFrame> frame) override
+  const QByteArray platformName = qgetenv("QT_QPA_PLATFORM");
+  const bool useWaylandQt = platformName.startsWith("wayland");
+  if (!useWaylandQt && !XInitThreads())
   {
-    std::ofstream yuvfile("frame.yuv", std::ios::binary);
-    if (result == webrtc::DesktopCapturer::Result::SUCCESS)
-    {
-      std::cout << "[Callback] Frame captured: "
-                << frame->size().width() << "x" << frame->size().height() << "format" << frame->pixel_format() << std::endl;
-      // 保存为 YUV 文件
-      int width = frame->size().width();
-      int height = frame->size().height();
-      const uint8_t *data = frame->data();
-      int stride = frame->stride();
-      yuvfile.write(reinterpret_cast<const char *>(data), stride * height);
-      yuvfile.close();
-    }
-    else
-    {
-      std::cout << "[Callback] Capture failed with result: " << static_cast<int>(result) << std::endl;
-    }
+    RTC_LOG(LS_ERROR) << "Failed to initialize XInitThreads";
+    return false;
   }
-};
+
+  return true;
+#elif defined(TWEBRTC_PLATFORM_WINDOWS)
+  static_cast<void>(autostart);
+  RTC_LOG(LS_INFO) << "Windows runtime initialization placeholder active.";
+  return true;
+#elif defined(TWEBRTC_PLATFORM_MACOS)
+  static_cast<void>(autostart);
+  RTC_LOG(LS_INFO) << "macOS runtime initialization placeholder active.";
+  return true;
+#else
+  static_cast<void>(autostart);
+  RTC_LOG(LS_WARNING) << "Running on an unverified platform; using default runtime initialization.";
+  return true;
+#endif
+}
+
+} // namespace
 
 int main(int argc, char *argv[])
 {
@@ -91,28 +104,12 @@ int main(int argc, char *argv[])
     RTC_LOG(LS_ERROR) << "Failed to initialize SSL";
     return 2;
   }
-#if defined(Q_OS_LINUX)
-  const QByteArray sessionType = qgetenv("XDG_SESSION_TYPE");
-  const QByteArray waylandDisplay = qgetenv("WAYLAND_DISPLAY");
-  if (!autostart && qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM") &&
-      (sessionType == "wayland" || !waylandDisplay.isEmpty()))
-  {
-    const QString pluginRoot = qEnvironmentVariable("QT_PLUGIN_PATH");
-    const QFileInfo waylandPlugin(pluginRoot + "/platforms/libqwayland-generic.so");
-    if (waylandPlugin.exists())
-    {
-      qputenv("QT_QPA_PLATFORM", QByteArray("wayland"));
-    }
-  }
 
-  const QByteArray platformName = qgetenv("QT_QPA_PLATFORM");
-  const bool useWaylandQt = platformName.startsWith("wayland");
-  if (!useWaylandQt && !XInitThreads())
+  if (!InitializePlatformRuntime(autostart))
   {
-    RTC_LOG(LS_ERROR) << "Failed to initialize XInitThreads";
+    webrtc::CleanupSSL();
     return 3;
   }
-#endif
 
   if (autostart)
   {
@@ -153,37 +150,6 @@ int main(int argc, char *argv[])
   // SignalingClient sigClient;
   // sigClient.connectToServer("ws://localhost:8000/server");
 
-#if 0
-  std::thread tmp([]()
-                  {
-                    MyDesktopCapturerCallback callback;
-                    auto screen_capture_ = webrtc::DesktopCapturer::CreateScreenCapturer(webrtc::DesktopCaptureOptions::CreateDefault());
-                    if (!screen_capture_)
-                    {
-                      RTC_LOG(LS_ERROR) << "Failed to create CreateScreenCapturer";
-                      return;
-                    }
-                    webrtc::DesktopCapturer::SourceList sources;
-                    screen_capture_->GetSourceList(&sources);
-                    int id = 0;
-                    for (const auto &src : sources)
-                    {
-                      std::cout << "id: " << src.id << ", title: " << src.title << std::endl;
-                      id = src.id;
-                    }
-                    screen_capture_->SelectSource(id);  // 选择屏幕ID
-                    screen_capture_->Start(&callback); // 设置回调函数
-                    int cnt=0;
-while(true)
-{
-if(++cnt>50) break;
-screen_capture_->CaptureFrame(); // 捕获一帧
-std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 等待回调完成
-}
-std::this_thread::sleep_for(std::chrono::seconds(1));
-                    screen_capture_.reset(); });
-  tmp.detach();
-#endif
   std::cout << "Hello, World!" << std::endl;
   app.exec();
   webrtc::CleanupSSL();

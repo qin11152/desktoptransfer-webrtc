@@ -2,19 +2,68 @@ cmake_minimum_required(VERSION 3.15)
 
 project(twebrtc)
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+endif()
+
+if(WIN32)
+    set(TWEBRTC_PLATFORM windows)
+elseif(APPLE)
+    set(TWEBRTC_PLATFORM macos)
+elseif(UNIX)
+    set(TWEBRTC_PLATFORM linux)
+else()
+    set(TWEBRTC_PLATFORM unknown)
+endif()
+
+set(THIRD_PARTY_ROOT ${CMAKE_SOURCE_DIR}/3rd)
+set(THIRD_PARTY_INCLUDE_DIR ${THIRD_PARTY_ROOT}/include)
+set(THIRD_PARTY_LIB_ROOT ${THIRD_PARTY_ROOT}/lib)
+set(THIRD_PARTY_PLATFORM_LIB_DIR ${THIRD_PARTY_LIB_ROOT}/${TWEBRTC_PLATFORM})
+set(PLATFORM_RUNTIME_OUTPUT_ROOT ${CMAKE_SOURCE_DIR}/bin/${TWEBRTC_PLATFORM})
+
+if(EXISTS "${THIRD_PARTY_PLATFORM_LIB_DIR}")
+    set(ACTIVE_THIRD_PARTY_LIB_DIR "${THIRD_PARTY_PLATFORM_LIB_DIR}")
+elseif(TWEBRTC_PLATFORM STREQUAL "linux" AND EXISTS "${THIRD_PARTY_LIB_ROOT}/libwebrtc.a")
+    set(ACTIVE_THIRD_PARTY_LIB_DIR "${THIRD_PARTY_LIB_ROOT}")
+    message(WARNING "Using legacy third-party library layout from ${THIRD_PARTY_LIB_ROOT}; move Linux libraries into ${THIRD_PARTY_PLATFORM_LIB_DIR}.")
+else()
+    message(FATAL_ERROR "No third-party library directory found for platform ${TWEBRTC_PLATFORM}: ${THIRD_PARTY_PLATFORM_LIB_DIR}")
+endif()
+
+message(STATUS "Configuring ${PROJECT_NAME} for platform: ${TWEBRTC_PLATFORM}")
+
+function(configure_platform_output target_name)
+    if(CMAKE_CONFIGURATION_TYPES)
+        foreach(config Debug Release RelWithDebInfo MinSizeRel)
+            string(TOUPPER "${config}" config_upper)
+            set_target_properties(${target_name} PROPERTIES
+                RUNTIME_OUTPUT_DIRECTORY_${config_upper} "${PLATFORM_RUNTIME_OUTPUT_ROOT}/${config}"
+                LIBRARY_OUTPUT_DIRECTORY_${config_upper} "${PLATFORM_RUNTIME_OUTPUT_ROOT}/${config}"
+                ARCHIVE_OUTPUT_DIRECTORY_${config_upper} "${PLATFORM_RUNTIME_OUTPUT_ROOT}/${config}")
+        endforeach()
+    else()
+        set(_output_config "${CMAKE_BUILD_TYPE}")
+        if(NOT _output_config)
+            set(_output_config Debug)
+        endif()
+        set_target_properties(${target_name} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${PLATFORM_RUNTIME_OUTPUT_ROOT}/${_output_config}"
+            LIBRARY_OUTPUT_DIRECTORY "${PLATFORM_RUNTIME_OUTPUT_ROOT}/${_output_config}"
+            ARCHIVE_OUTPUT_DIRECTORY "${PLATFORM_RUNTIME_OUTPUT_ROOT}/${_output_config}")
+    endif()
+endfunction()
+
 aux_source_directory(. srcs)
 file(GLOB_RECURSE module ${CMAKE_SOURCE_DIR}/module/*.cpp)
 file(GLOB_RECURSE ui ${CMAKE_SOURCE_DIR}/ui/*.cpp)
 
-#设置可执行文件输出目录
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin/${CMAKE_BUILD_TYPE})
-SET(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
-SET(CMAKE_INSTALL_RPATH "\${ORIGIN}/lib")
-
-if(NOT DEFINED CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "")
-	set(APPLICATION_DIR_PATH ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${Player_BUILD_TYPE})
-else()
-	set(APPLICATION_DIR_PATH ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+if(APPLE)
+    set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
+    set(CMAKE_INSTALL_RPATH "@loader_path/lib")
+elseif(UNIX)
+    set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
+    set(CMAKE_INSTALL_RPATH "\${ORIGIN}/lib")
 endif()
 
 set(CMAKE_CXX_STANDARD 20)
@@ -29,6 +78,9 @@ set(CMAKE_INCLUDE_CURRENT_DIR ON)
 add_executable(${PROJECT_NAME} ${srcs} ${module} ${ui})
 add_executable(signaling_server tools/signaling_server.cpp)
 
+configure_platform_output(${PROJECT_NAME})
+configure_platform_output(signaling_server)
+
 find_package(Qt5 REQUIRED COMPONENTS Gui Widgets Network WebSockets)
 if(UNIX AND NOT APPLE)
     find_package(X11 REQUIRED)
@@ -36,9 +88,21 @@ if(UNIX AND NOT APPLE)
     pkg_check_modules(PIPEWIRE libpipewire-0.3)
 endif()
 
-target_link_directories(${PROJECT_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/3rd/lib)
+unset(TWEBRTC_RELEASE_LIBRARY CACHE)
+unset(TWEBRTC_DEBUG_LIBRARY CACHE)
+find_library(TWEBRTC_RELEASE_LIBRARY NAMES webrtc PATHS "${ACTIVE_THIRD_PARTY_LIB_DIR}" NO_DEFAULT_PATH)
+find_library(TWEBRTC_DEBUG_LIBRARY NAMES webrtc_d webrtc PATHS "${ACTIVE_THIRD_PARTY_LIB_DIR}" NO_DEFAULT_PATH)
 
-set(WEBRTC_ABSL_DIR "${CMAKE_SOURCE_DIR}/3rd/include/rtc/third_party/abseil-cpp"
+if(NOT TWEBRTC_RELEASE_LIBRARY)
+    message(FATAL_ERROR "Failed to find the release WebRTC library in ${ACTIVE_THIRD_PARTY_LIB_DIR}")
+endif()
+
+if(NOT TWEBRTC_DEBUG_LIBRARY)
+    set(TWEBRTC_DEBUG_LIBRARY "${TWEBRTC_RELEASE_LIBRARY}")
+    message(WARNING "Debug WebRTC library was not found in ${ACTIVE_THIRD_PARTY_LIB_DIR}; Debug builds will reuse the release library.")
+endif()
+
+set(WEBRTC_ABSL_DIR "${THIRD_PARTY_INCLUDE_DIR}/rtc/third_party/abseil-cpp"
     CACHE PATH "Path to a complete abseil-cpp headers tree used by WebRTC")
 
 function(webrtc_is_complete_absl_tree dir result_var)
@@ -53,7 +117,7 @@ endfunction()
 
 set(_webrtc_absl_candidates
     "${WEBRTC_ABSL_DIR}"
-    "${CMAKE_SOURCE_DIR}/3rd/include/rtc/third_party/abseil-cpp"
+    "${THIRD_PARTY_INCLUDE_DIR}/rtc/third_party/abseil-cpp"
     "/home/qin/sdk/rtc/webrtc-checkout/src/third_party/abseil-cpp")
 
 set(_webrtc_absl_resolved "")
@@ -79,22 +143,23 @@ set(WEBRTC_ABSL_DIR "${_webrtc_absl_resolved}" CACHE PATH
 
 # target_include_directories(${PROJECT_NAME} PRIVATE /home/qin/rtc/webrtc-checkout/src/third_party/jsoncpp/source/include)
 target_include_directories(${PROJECT_NAME} BEFORE PRIVATE ${WEBRTC_ABSL_DIR})
-target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/3rd/include/rtc)
-target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/3rd/include)
+target_include_directories(${PROJECT_NAME} PRIVATE ${THIRD_PARTY_INCLUDE_DIR}/rtc)
+target_include_directories(${PROJECT_NAME} PRIVATE ${THIRD_PARTY_INCLUDE_DIR})
 
-#查看是debug还是release
-
-
-if("Debug" STREQUAL "${CMAKE_BUILD_TYPE}")
-    message(STATUS "Debug mode: Adding debug libraries")
-    target_link_libraries(${PROJECT_NAME} PRIVATE webrtc_d)
-else()
-    message(STATUS "Release mode: Adding release libraries")
-    target_link_libraries(${PROJECT_NAME} PRIVATE webrtc)
+if(TWEBRTC_PLATFORM STREQUAL "linux")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE TWEBRTC_PLATFORM_LINUX)
+elseif(TWEBRTC_PLATFORM STREQUAL "windows")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE TWEBRTC_PLATFORM_WINDOWS)
+elseif(TWEBRTC_PLATFORM STREQUAL "macos")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE TWEBRTC_PLATFORM_MACOS)
 endif()
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
-    stdc++
+    debug ${TWEBRTC_DEBUG_LIBRARY}
+    optimized ${TWEBRTC_RELEASE_LIBRARY}
+)
+
+target_link_libraries(${PROJECT_NAME} PRIVATE
     Qt5::Core
     Qt5::Gui
     Qt5::Widgets
@@ -145,8 +210,4 @@ target_link_libraries(signaling_server PRIVATE
     Qt5::Core
     Qt5::Network
     Qt5::WebSockets
-)
-
-set_target_properties(signaling_server PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin/${CMAKE_BUILD_TYPE}
 )
