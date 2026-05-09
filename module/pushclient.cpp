@@ -627,11 +627,14 @@ bool WebRTCPushClient::CreateAndSendOffer(bool ice_restart)
     webrtc::PeerConnectionInterface::RTCOfferAnswerOptions opts;
     opts.ice_restart = ice_restart;
 
+    //创建offer成功后，会调用传入的CreateSessionDescriptionObserverq的success回调，设置本地描述并通过信令回调发送给对端。
+    //CreateSessionDescriptionObserverq的第一个参数是success回调，第二个参数是failure回调。
     pc_->CreateOffer(
         new webrtc::RefCountedObject<webrtc::CreateSessionDescriptionObserverq>(
             [this](webrtc::SessionDescriptionInterface *desc)
             {
                 // 创建 offer 成功后先设为本地描述，再通过业务层信令回调发给接收端。
+                //都一个参数是观察者，用来接收 SetLocalDescription 的结果回调；另一个参数是要设置的描述。
                 pc_->SetLocalDescription(
                     new webrtc::RefCountedObject<webrtc::SetSessionDescriptionObserverq>(),
                     desc);
