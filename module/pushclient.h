@@ -57,6 +57,16 @@ struct IceCandidateBundle
     std::string id;
 };
 
+struct AudioEncodingConfig
+{
+    int channels{2};
+    int max_playback_rate_hz{48000};
+    int max_bitrate_bps{128000};
+    bool enable_fec{true};
+    bool enable_dtx{false};
+    bool adaptive_ptime{true};
+};
+
 // 轻量信令抽象：WebRTCPushClient 不直接依赖具体网络层，而是通过回调把 SDP/ICE 交给上层发送。
 class SimpleSignaling
 {
@@ -111,7 +121,10 @@ private:
 class CapturerTrackSource : public webrtc::VideoTrackSource
 {
 public:
-    static webrtc::scoped_refptr<CapturerTrackSource> Create(int target_fps = 30, bool capture_cursor = true);
+    static webrtc::scoped_refptr<CapturerTrackSource> Create(int target_fps = 30,
+                                                             bool capture_cursor = true,
+                                                             int output_width = 0,
+                                                             int output_height = 0);
 
     ~CapturerTrackSource() override
     {
@@ -122,6 +135,8 @@ public:
 
 public:
     CapturerTrackSource();
+    void SetCaptureResolution(int width, int height);
+    void SetOutputResolution(int width, int height);
 
     // 被采集线程调用，把新帧广播到所有 sink。
     void OnCapturedFrame(const webrtc::VideoFrame &frame)
@@ -161,6 +176,10 @@ private:
     webrtc::VideoBroadcaster broadcaster_;
 
     int m_iTargetFps{25};
+    int capture_width_{0};
+    int capture_height_{0};
+    int output_width_{0};
+    int output_height_{0};
 
     // 实现 VideoTrackSource 的纯虚函数 source()
 public:
@@ -286,6 +305,7 @@ public:
     WebRTCPushClient(std::string id);
     ~WebRTCPushClient();
     std::string getId() const { return id; }
+    void SetAudioEncodingConfig(const AudioEncodingConfig &config) { audio_encoding_config_ = config; }
     // 初始化 PeerConnectionFactory 与 PeerConnection
     bool Init(const std::vector<IceServerConfig> &ice_servers);
 
@@ -319,6 +339,8 @@ private:
     // 懒初始化桌面采集源，避免在 WebRTC 工厂尚未就绪时提前占用资源。
     bool PrepareDesktopVideoSource(int fps);
     bool ConfigureAudioCaptureDevice();
+    bool ConfigureAudioCodecPreferences(webrtc::RtpTransceiverInterface *transceiver);
+    bool ConfigureAudioSenderParameters();
 
     // PeerConnection 及其相关媒体对象。
     webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc_;
@@ -337,6 +359,7 @@ private:
     std::unique_ptr<webrtc::Thread> worker_thread_;
     std::unique_ptr<webrtc::Thread> signaling_thread_;
     std::string id{""};
+    AudioEncodingConfig audio_encoding_config_{};
 
     // RTP 发送诊断状态：通过周期性读取 stats 判断视频是否真正发出。
     std::atomic<bool> stats_polling_{false};

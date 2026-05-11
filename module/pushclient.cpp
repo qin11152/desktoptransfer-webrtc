@@ -48,6 +48,11 @@ std::string AsciiLower(std::string value)
     return value;
 }
 
+std::string BoolToFmtpValue(bool enabled)
+{
+    return enabled ? "1" : "0";
+}
+
 bool LooksLikeSystemLoopbackDevice(const char* name, const char* guid)
 {
     const std::string device_name = AsciiLower(name ? name : "");
@@ -320,11 +325,15 @@ namespace webrtc
     };
 } // namespace webrtc
 
-webrtc::scoped_refptr<CapturerTrackSource> CapturerTrackSource::Create(int target_fps, bool capture_cursor)
+webrtc::scoped_refptr<CapturerTrackSource> CapturerTrackSource::Create(int target_fps,
+                                                                       bool capture_cursor,
+                                                                       int output_width,
+                                                                       int output_height)
 {
     // 创建桌面采集源时先完成捕获器和源选择，失败则直接返回空指针。
     auto src = webrtc::make_ref_counted<CapturerTrackSource>();
     src->m_iTargetFps = target_fps;
+    src->SetOutputResolution(output_width, output_height);
     src->capturer_ = CreatePlatformScreenCapturer();
     if (!src->capturer_)
     {
@@ -343,6 +352,18 @@ webrtc::scoped_refptr<CapturerTrackSource> CapturerTrackSource::Create(int targe
 CapturerTrackSource::CapturerTrackSource()
     : webrtc::VideoTrackSource(/*remote*/ false), running_(false)
 {
+}
+
+void CapturerTrackSource::SetCaptureResolution(int width, int height)
+{
+    capture_width_ = width;
+    capture_height_ = height;
+}
+
+void CapturerTrackSource::SetOutputResolution(int width, int height)
+{
+    output_width_ = width;
+    output_height_ = height;
 }
 
 void CapturerTrackSource::Start()
@@ -387,8 +408,44 @@ void CapturerTrackSource::StartCaptureLoop(int target_fps, bool capture_cursor)
                                i420->MutableDataV(), i420->StrideV(),
                                width, height);
 
+            const int capture_width = src_->capture_width_ > 0 ? src_->capture_width_ : width;
+            const int capture_height = src_->capture_height_ > 0 ? src_->capture_height_ : height;
+            webrtc::scoped_refptr<webrtc::I420Buffer> capture_buffer = i420;
+            if (capture_width != width || capture_height != height)
+            {
+                auto scaled_buffer = webrtc::I420Buffer::Create(capture_width, capture_height);
+                libyuv::I420Scale(i420->DataY(), i420->StrideY(),
+                                  i420->DataU(), i420->StrideU(),
+                                  i420->DataV(), i420->StrideV(),
+                                  width, height,
+                                  scaled_buffer->MutableDataY(), scaled_buffer->StrideY(),
+                                  scaled_buffer->MutableDataU(), scaled_buffer->StrideU(),
+                                  scaled_buffer->MutableDataV(), scaled_buffer->StrideV(),
+                                  capture_width, capture_height,
+                                  libyuv::FilterMode::kFilterBox);
+                capture_buffer = scaled_buffer;
+            }
+
+            const int output_width = src_->output_width_ > 0 ? src_->output_width_ : capture_width;
+            const int output_height = src_->output_height_ > 0 ? src_->output_height_ : capture_height;
+            webrtc::scoped_refptr<webrtc::I420Buffer> output_buffer = capture_buffer;
+            if (output_width != capture_width || output_height != capture_height)
+            {
+                auto scaled_buffer = webrtc::I420Buffer::Create(output_width, output_height);
+                libyuv::I420Scale(capture_buffer->DataY(), capture_buffer->StrideY(),
+                                  capture_buffer->DataU(), capture_buffer->StrideU(),
+                                  capture_buffer->DataV(), capture_buffer->StrideV(),
+                                  capture_width, capture_height,
+                                  scaled_buffer->MutableDataY(), scaled_buffer->StrideY(),
+                                  scaled_buffer->MutableDataU(), scaled_buffer->StrideU(),
+                                  scaled_buffer->MutableDataV(), scaled_buffer->StrideV(),
+                                  output_width, output_height,
+                                  libyuv::FilterMode::kFilterBox);
+                output_buffer = scaled_buffer;
+            }
+
             webrtc::VideoFrame vf = webrtc::VideoFrame::Builder()
-                                        .set_video_frame_buffer(i420)
+                                        .set_video_frame_buffer(output_buffer)
                                         .set_timestamp_us(webrtc::TimeMicros())
                                         .build();
 
@@ -779,12 +836,14 @@ bool WebRTCPushClient::PrepareDesktopVideoSource(int fps)
         return true;
     }
 
-    capture_source_ = CapturerTrackSource::Create(fps);
+    capture_source_ = CapturerTrackSource::Create(fps, true, 3840, 2160);
     if (!capture_source_)
     {
         RTC_LOG(LS_ERROR) << "Desktop capture is not available in the current environment";
         return false;
     }
+
+    capture_source_->SetCaptureResolution(1920, 1080);
 
     file_source_ = FileVideoTrackSource::Create(640, 480, fps);
     if(!file_source_)
@@ -937,14 +996,104 @@ bool WebRTCPushClient::AddLocalAudio()
         return false;
     }
 
-    audio_sender_ = transceiver_or.value()->sender();
+    auto transceiver = transceiver_or.value();
+    if (!ConfigureAudioCodecPreferences(transceiver.get()))
+    {
+        RTC_LOG(LS_ERROR) << "Failed to configure audio codec preferences";
+        audio_track_ = nullptr;
+        return false;
+    }
+
+    audio_sender_ = transceiver->sender();
+    if (!ConfigureAudioSenderParameters())
+    {
+        RTC_LOG(LS_ERROR) << "Failed to configure audio sender parameters";
+        audio_track_ = nullptr;
+        audio_sender_ = nullptr;
+        return false;
+    }
+
     return true;
 }
+
+bool WebRTCPushClient::ConfigureAudioCodecPreferences(webrtc::RtpTransceiverInterface *transceiver)
+{
+    if (!factory_ || !transceiver)
+    {
+        return false;
+    }
+
+    auto capabilities = factory_->GetRtpSenderCapabilities(webrtc::MediaType::AUDIO);
+    if (capabilities.codecs.empty())
+    {
+        RTC_LOG(LS_WARNING) << "Audio sender capabilities are empty; keeping default codec preferences.";
+        return true;
+    }
+
+    std::vector<webrtc::RtpCodecCapability> preferred_codecs;
+    preferred_codecs.reserve(capabilities.codecs.size());
+
+    for (const auto &codec : capabilities.codecs)
+    {
+        if (AsciiLower(codec.name) == "opus")
+        {
+            preferred_codecs.insert(preferred_codecs.begin(), codec);
+            continue;
+        }
+
+        preferred_codecs.push_back(codec);
+    }
+
+    auto error = transceiver->SetCodecPreferences(preferred_codecs);
+    if (!error.ok())
+    {
+        RTC_LOG(LS_ERROR) << "SetCodecPreferences failed: " << error.message();
+        return false;
+    }
+
+    return true;
+}
+
+bool WebRTCPushClient::ConfigureAudioSenderParameters()
+{
+    if (!audio_sender_)
+    {
+        return false;
+    }
+
+    webrtc::RtpParameters params = audio_sender_->GetParameters();
+    if (params.encodings.empty())
+    {
+        params.encodings.emplace_back();
+    }
+
+    auto &encoding = params.encodings[0];
+    if (audio_encoding_config_.max_bitrate_bps > 0)
+    {
+        encoding.max_bitrate_bps = audio_encoding_config_.max_bitrate_bps;
+    }
+    encoding.adaptive_ptime = audio_encoding_config_.adaptive_ptime;
+
+    auto error = audio_sender_->SetParameters(params);
+    if (!error.ok())
+    {
+        RTC_LOG(LS_ERROR) << "Audio sender SetParameters failed: " << error.message();
+        return false;
+    }
+
+    return true;
+}
+
 
 bool WebRTCPushClient::AddDesktopVideo(int fps, int max_bitrate_bps)
 {
     if (!factory_ || !pc_)
         return false;
+
+    constexpr int kTargetOutputWidth = 3840;
+    constexpr int kTargetOutputHeight = 2160;
+    constexpr int kRecommended4kBitrateBps = 12'000'000;
+    const int effective_max_bitrate_bps = std::max(max_bitrate_bps, kRecommended4kBitrateBps);
 
     // 视频轨是在 PeerConnection 创建成功后补进去的，随后会生成 sendonly transceiver。
     if (!PrepareDesktopVideoSource(fps))
@@ -953,7 +1102,7 @@ bool WebRTCPushClient::AddDesktopVideo(int fps, int max_bitrate_bps)
         return false;
     }
 
-    video_track_ = factory_->CreateVideoTrack(file_source_, "ffmpeg");
+    video_track_ = factory_->CreateVideoTrack(capture_source_, "ffmpeg");
     if (!video_track_)
     {
         printf("Failed to create VideoTrack\n");
@@ -973,17 +1122,28 @@ bool WebRTCPushClient::AddDesktopVideo(int fps, int max_bitrate_bps)
     video_sender_ = transceiver->sender();
 
     // 设置编码器初始码率上限，避免桌面流默认码率过高。
-    if (max_bitrate_bps > 0)
+    if (effective_max_bitrate_bps > 0)
     {
         webrtc::RtpParameters params = video_sender_->GetParameters();
         if (!params.encodings.empty())
         {
-            params.encodings[0].max_bitrate_bps = max_bitrate_bps;
-            video_sender_->SetParameters(params);
+            params.encodings[0].max_bitrate_bps = effective_max_bitrate_bps;
+            params.encodings[0].scale_resolution_down_to = webrtc::Resolution{kTargetOutputWidth, kTargetOutputHeight};
         }
+        params.degradation_preference = webrtc::DegradationPreference::MAINTAIN_RESOLUTION;
+
+        auto error = video_sender_->SetParameters(params);
+        if (!error.ok())
+        {
+            RTC_LOG(LS_ERROR) << "Video sender SetParameters failed: " << error.message();
+            return false;
+        }
+
+        RTC_LOG(LS_INFO) << "Configured video sender for " << kTargetOutputWidth << "x" << kTargetOutputHeight
+                         << " with max bitrate " << effective_max_bitrate_bps << " bps";
     }
 
-    file_source_->Start();
+    capture_source_->Start();
     return true;
 }
 
