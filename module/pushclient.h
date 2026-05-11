@@ -5,13 +5,16 @@
 #include <atomic>
 #include <thread>
 #include <functional>
+#include <mutex>
 
 #include "api/peer_connection_interface.h"
 #include "api/create_peerconnection_factory.h"
+#include "api/video/i420_buffer.h"
 #include "api/video/video_frame.h"
 #include "api/video_track_source_proxy_factory.h"
 #include "api/video_track_source_constraints.h"
 #include "api/media_stream_interface.h"
+#include "api/audio/audio_device.h"
 #include "api/rtp_sender_interface.h"
 #include "api/rtp_parameters.h"
 #include "pc/session_description.h"
@@ -167,6 +170,62 @@ public:
     }
 };
 
+// 自定义 I420/YUV420P 视频源：以固定帧率回调业务层生成每一帧数据。
+class FileVideoTrackSource : public webrtc::VideoTrackSource
+{
+public:
+    using FrameGenerator = std::function<bool(int frame_index, webrtc::I420Buffer &buffer)>;
+
+    static webrtc::scoped_refptr<FileVideoTrackSource> Create(int width, int height, int target_fps = 30);
+
+    ~FileVideoTrackSource() override
+    {
+        Stop();
+    }
+
+    FileVideoTrackSource(int width, int height, int target_fps);
+
+    void SetFrameGenerator(FrameGenerator generator);
+    void Start();
+    void Stop();
+
+protected:
+    webrtc::MediaSourceInterface::SourceState state() const override
+    {
+        return webrtc::MediaSourceInterface::SourceState::kLive;
+    }
+    bool remote() const override { return false; }
+
+    void AddOrUpdateSink(webrtc::VideoSinkInterface<webrtc::VideoFrame> *sink,
+                         const webrtc::VideoSinkWants &wants) override
+    {
+        broadcaster_.AddOrUpdateSink(sink, wants);
+    }
+
+    void RemoveSink(webrtc::VideoSinkInterface<webrtc::VideoFrame> *sink) override
+    {
+        broadcaster_.RemoveSink(sink);
+    }
+
+public:
+    webrtc::VideoSourceInterface<webrtc::VideoFrame> *source() override
+    {
+        return nullptr;
+    }
+
+private:
+    void RunFrameLoop();
+
+    int width_;
+    int height_;
+    int target_fps_;
+    std::atomic<bool> running_{false};
+    std::thread frame_thread_;
+    webrtc::VideoBroadcaster broadcaster_;
+    std::mutex generator_mutex_;
+    FrameGenerator frame_generator_;
+};
+
 class WebRTCPushClient;
 
 // PeerConnection 观察者：负责接收连接状态和本地 ICE 事件，并回调到业务层。
@@ -259,16 +318,18 @@ public:
 private:
     // 懒初始化桌面采集源，避免在 WebRTC 工厂尚未就绪时提前占用资源。
     bool PrepareDesktopVideoSource(int fps);
+    bool ConfigureAudioCaptureDevice();
 
     // PeerConnection 及其相关媒体对象。
     webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc_;
     webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory_;
+    webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm_;
     webrtc::scoped_refptr<webrtc::VideoTrackInterface> video_track_;
     webrtc::scoped_refptr<webrtc::RtpSenderInterface> video_sender_;
     webrtc::scoped_refptr<webrtc::AudioTrackInterface> audio_track_;
     webrtc::scoped_refptr<webrtc::RtpSenderInterface> audio_sender_;
     webrtc::scoped_refptr<CapturerTrackSource> capture_source_;
-
+    webrtc::scoped_refptr<FileVideoTrackSource> file_source_;
     std::unique_ptr<PeerObserver> observer_;
 
     // WebRTC 线程模型要求的网络/工作/信令线程。

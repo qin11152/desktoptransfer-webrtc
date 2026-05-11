@@ -34,9 +34,113 @@
 #include "api/stats/rtc_stats_collector_callback.h"
 #include "api/stats/rtcstats_objects.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
 #include <cstdlib>
 
 namespace {
+
+std::string AsciiLower(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch)
+                   { return static_cast<char>(std::tolower(ch)); });
+    return value;
+}
+
+bool LooksLikeSystemLoopbackDevice(const char* name, const char* guid)
+{
+    const std::string device_name = AsciiLower(name ? name : "");
+    const std::string device_guid = AsciiLower(guid ? guid : "");
+
+    return device_name.find("monitor") != std::string::npos ||
+           device_name.find("loopback") != std::string::npos ||
+           device_guid.find("monitor") != std::string::npos ||
+           device_guid.find("loopback") != std::string::npos;
+}
+
+std::string DetectPulseMonitorSourceName()
+{
+#if defined(TWEBRTC_PLATFORM_LINUX)
+    FILE* pipe = popen("pactl list short sources 2>/dev/null", "r");
+    if (!pipe)
+    {
+        return "";
+    }
+
+    char buffer[512] = {0};
+    std::string monitor_source;
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr)
+    {
+        const std::string line = buffer;
+        const std::string lowered = AsciiLower(line);
+        if (lowered.find(".monitor") == std::string::npos && lowered.find("monitor") == std::string::npos)
+        {
+            continue;
+        }
+
+        const auto first_tab = line.find('\t');
+        if (first_tab == std::string::npos)
+        {
+            continue;
+        }
+
+        const auto second_tab = line.find('\t', first_tab + 1);
+        if (second_tab == std::string::npos)
+        {
+            continue;
+        }
+
+        monitor_source = line.substr(first_tab + 1, second_tab - first_tab - 1);
+        break;
+    }
+
+    pclose(pipe);
+    return monitor_source;
+#else
+    return "";
+#endif
+}
+
+void OverridePulseSourceWithMonitorIfAvailable()
+{
+#if defined(TWEBRTC_PLATFORM_LINUX)
+    const char* existing_source = std::getenv("PULSE_SOURCE");
+    if (existing_source && *existing_source)
+    {
+        RTC_LOG(LS_INFO) << "Using existing PULSE_SOURCE override: " << existing_source;
+        return;
+    }
+
+    const std::string monitor_source = DetectPulseMonitorSourceName();
+    if (monitor_source.empty())
+    {
+        RTC_LOG(LS_WARNING) << "No PulseAudio monitor source detected via pactl; system audio capture may fall back to microphone/default input.";
+        return;
+    }
+
+    setenv("PULSE_SOURCE", monitor_source.c_str(), 1);
+    RTC_LOG(LS_INFO) << "Set PULSE_SOURCE to monitor source: " << monitor_source;
+#endif
+}
+
+webrtc::scoped_refptr<webrtc::AudioDeviceModule> CreatePlatformAudioDeviceModule(const webrtc::Environment& env)
+{
+#if defined(TWEBRTC_PLATFORM_LINUX)
+    OverridePulseSourceWithMonitorIfAvailable();
+
+    auto adm = webrtc::CreateAudioDeviceModule(env, webrtc::AudioDeviceModule::kLinuxPulseAudio);
+    if (adm)
+    {
+        RTC_LOG(LS_INFO) << "Using PulseAudio ADM for system audio capture.";
+        return adm;
+    }
+
+    RTC_LOG(LS_WARNING) << "Failed to create PulseAudio ADM, falling back to platform default audio.";
+#endif
+
+    return webrtc::CreateAudioDeviceModule(env, webrtc::AudioDeviceModule::kPlatformDefaultAudio);
+}
 
 // 判定当前 Linux 会话是否更接近 Wayland 语义。
 // 这会影响是否启用 PipeWire，以及使用哪类桌面捕获后端。
@@ -307,6 +411,119 @@ void CapturerTrackSource::StartCaptureLoop(int target_fps, bool capture_cursor)
     }
 }
 
+namespace {
+
+void FillSyntheticI420Frame(webrtc::I420Buffer* buffer, int frame_index)
+{
+    const int width = buffer->width();
+    const int height = buffer->height();
+
+    for (int y = 0; y < height; ++y)
+    {
+        uint8_t* row = buffer->MutableDataY() + y * buffer->StrideY();
+        for (int x = 0; x < width; ++x)
+        {
+            row[x] = static_cast<uint8_t>((x + frame_index * 3) % 256);
+        }
+    }
+
+    const int chroma_width = buffer->ChromaWidth();
+    const int chroma_height = buffer->ChromaHeight();
+    const uint8_t u_value = static_cast<uint8_t>(96 + (frame_index % 64));
+    const uint8_t v_value = static_cast<uint8_t>(160 - (frame_index % 64));
+
+    for (int y = 0; y < chroma_height; ++y)
+    {
+        std::memset(buffer->MutableDataU() + y * buffer->StrideU(), u_value, chroma_width);
+        std::memset(buffer->MutableDataV() + y * buffer->StrideV(), v_value, chroma_width);
+    }
+}
+
+} // namespace
+
+webrtc::scoped_refptr<FileVideoTrackSource> FileVideoTrackSource::Create(int width, int height, int target_fps)
+{
+    if (width <= 0 || height <= 0)
+    {
+        RTC_LOG(LS_ERROR) << "Invalid FileVideoTrackSource size: " << width << "x" << height;
+        return nullptr;
+    }
+
+    return webrtc::make_ref_counted<FileVideoTrackSource>(width, height, target_fps);
+}
+
+FileVideoTrackSource::FileVideoTrackSource(int width, int height, int target_fps)
+    : webrtc::VideoTrackSource(/*remote*/ false),
+      width_(width),
+      height_(height),
+      target_fps_(std::max(1, target_fps))
+{
+}
+
+void FileVideoTrackSource::SetFrameGenerator(FrameGenerator generator)
+{
+    std::lock_guard<std::mutex> lock(generator_mutex_);
+    frame_generator_ = std::move(generator);
+}
+
+void FileVideoTrackSource::Start()
+{
+    if (running_.exchange(true))
+    {
+        return;
+    }
+
+    frame_thread_ = std::thread([this]()
+                                { RunFrameLoop(); });
+}
+
+void FileVideoTrackSource::Stop()
+{
+    if (!running_.exchange(false))
+    {
+        return;
+    }
+
+    if (frame_thread_.joinable())
+    {
+        frame_thread_.join();
+    }
+}
+
+void FileVideoTrackSource::RunFrameLoop()
+{
+    const auto frame_interval = std::chrono::microseconds(1000000 / target_fps_);
+    auto next_tick = std::chrono::steady_clock::now();
+    int frame_index = 0;
+
+    while (running_)
+    {
+        auto buffer = webrtc::I420Buffer::Create(width_, height_);
+
+        FrameGenerator generator;
+        {
+            std::lock_guard<std::mutex> lock(generator_mutex_);
+            generator = frame_generator_;
+        }
+
+        const bool has_frame = generator ? generator(frame_index, *buffer) : false;
+        if (!has_frame)
+        {
+            FillSyntheticI420Frame(buffer.get(), frame_index);
+        }
+
+        webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
+                                       .set_video_frame_buffer(buffer)
+                                       .set_timestamp_us(webrtc::TimeMicros())
+                                       .build();
+        broadcaster_.OnFrame(frame);
+
+        ++frame_index;
+        next_tick += frame_interval;
+        std::this_thread::sleep_until(next_tick);
+    }
+}
+
 webrtc::scoped_refptr<DesktopCapturerSource> DesktopCapturerSource::Create(bool is_screen)
 {
     // return webrtc::scoped_refptr<DesktopCapturerSource>(
@@ -411,8 +628,29 @@ WebRTCPushClient::WebRTCPushClient(std::string id)
 WebRTCPushClient::~WebRTCPushClient()
 {
     StopRtpSendStatsPolling();
-    pc_ = nullptr;
-    factory_ = nullptr;
+    if (worker_thread_)
+    {
+        worker_thread_->BlockingCall([this]()
+                                     {
+            pc_ = nullptr;
+            factory_ = nullptr;
+            audio_track_ = nullptr;
+            audio_sender_ = nullptr;
+            video_track_ = nullptr;
+            video_sender_ = nullptr;
+            adm_ = nullptr; });
+    }
+    else
+    {
+        pc_ = nullptr;
+        factory_ = nullptr;
+        audio_track_ = nullptr;
+        audio_sender_ = nullptr;
+        video_track_ = nullptr;
+        video_sender_ = nullptr;
+        adm_ = nullptr;
+    }
+
     if (network_thread_)
     {
         network_thread_->Stop();
@@ -440,7 +678,22 @@ bool WebRTCPushClient::Init(const std::vector<IceServerConfig> &ice_servers)
     deps.network_thread = network_thread_.get();
     deps.worker_thread = worker_thread_.get();
     deps.signaling_thread = signaling_thread_.get();
-    deps.adm = webrtc::CreateAudioDeviceModule(env, webrtc::AudioDeviceModule::kDummyAudio);
+    const bool audio_ready = worker_thread_->BlockingCall([this, &env]()
+                                                          {
+        adm_ = CreatePlatformAudioDeviceModule(env);
+        if (!adm_)
+        {
+            RTC_LOG(LS_ERROR) << "Failed to create audio device module";
+            return false;
+        }
+
+        return ConfigureAudioCaptureDevice(); });
+    if (!audio_ready)
+    {
+        return false;
+    }
+
+    deps.adm = adm_;
     deps.audio_encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
     deps.audio_decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
     deps.video_encoder_factory =
@@ -510,12 +763,17 @@ bool WebRTCPushClient::Init(const std::vector<IceServerConfig> &ice_servers)
         return false;
     }
 
+    if (!AddLocalAudio())
+    {
+        return false;
+    }
+
     return CreateAndSendOffer();
 }
 
 bool WebRTCPushClient::PrepareDesktopVideoSource(int fps)
 {
-    if (capture_source_)
+    if (capture_source_ || file_source_)
     {
         // 已创建过时直接复用，避免重复启动捕获器。
         return true;
@@ -528,6 +786,124 @@ bool WebRTCPushClient::PrepareDesktopVideoSource(int fps)
         return false;
     }
 
+    file_source_ = FileVideoTrackSource::Create(640, 480, fps);
+    if(!file_source_)
+    {
+        RTC_LOG(LS_ERROR) << "Failed to create file video source";
+        return false;
+    }
+
+    return true;
+}
+
+bool WebRTCPushClient::ConfigureAudioCaptureDevice()
+{
+    if (!adm_)
+    {
+        return false;
+    }
+
+    if (adm_->Init() != 0)
+    {
+        RTC_LOG(LS_ERROR) << "AudioDeviceModule init failed";
+        return false;
+    }
+
+#if defined(TWEBRTC_PLATFORM_LINUX)
+    const int16_t recording_devices = adm_->RecordingDevices();
+    RTC_LOG(LS_INFO) << "Audio recording devices reported by ADM: " << recording_devices;
+    if (recording_devices <= 0)
+    {
+        RTC_LOG(LS_ERROR) << "No recording devices were enumerated by the audio backend";
+        return false;
+    }
+
+    int selected_index = -1;
+    int fallback_index = -1;
+    for (int index = 0; index < recording_devices; ++index)
+    {
+        char name[webrtc::kAdmMaxDeviceNameSize] = {0};
+        char guid[webrtc::kAdmMaxGuidSize] = {0};
+        if (adm_->RecordingDeviceName(static_cast<uint16_t>(index), name, guid) != 0)
+        {
+            RTC_LOG(LS_WARNING) << "Failed to query recording device at index " << index;
+            continue;
+        }
+
+        RTC_LOG(LS_INFO) << "Recording device[" << index << "]: " << name << " (" << guid << ")";
+
+        if (adm_->SetRecordingDevice(static_cast<uint16_t>(index)) != 0)
+        {
+            RTC_LOG(LS_WARNING) << "Failed to select recording device[" << index << "] for probing";
+            continue;
+        }
+
+        bool device_available = false;
+        const bool available = adm_->RecordingIsAvailable(&device_available) == 0 && device_available;
+        RTC_LOG(LS_INFO) << "Recording device[" << index << "] available=" << (available ? "YES" : "NO");
+        if (!available)
+        {
+            continue;
+        }
+
+        if (fallback_index < 0)
+        {
+            fallback_index = index;
+        }
+
+        if (LooksLikeSystemLoopbackDevice(name, guid))
+        {
+            selected_index = index;
+            RTC_LOG(LS_INFO) << "Selected loopback recording device: " << name << " (" << guid << ")";
+            break;
+        }
+    }
+
+    if (selected_index < 0)
+    {
+        selected_index = fallback_index;
+    }
+
+    if (selected_index >= 0)
+    {
+        if (adm_->SetRecordingDevice(static_cast<uint16_t>(selected_index)) != 0)
+        {
+            RTC_LOG(LS_ERROR) << "Failed to select final recording device";
+            return false;
+        }
+
+        if (selected_index == fallback_index)
+        {
+            RTC_LOG(LS_WARNING) << "No available PulseAudio monitor/loopback source found; falling back to the first available recording device.";
+        }
+    }
+    else
+    {
+        RTC_LOG(LS_ERROR) << "No available recording source was found. PulseAudio currently exposes no capturable monitor or input source.";
+        return false;
+    }
+
+    bool recording_available = false;
+    if (adm_->RecordingIsAvailable(&recording_available) != 0 || !recording_available)
+    {
+        RTC_LOG(LS_ERROR) << "The selected recording device is not available for audio capture";
+        return false;
+    }
+#else
+    bool recording_available = false;
+    if (adm_->RecordingIsAvailable(&recording_available) != 0 || !recording_available)
+    {
+        RTC_LOG(LS_ERROR) << "No recording device is available for audio capture";
+        return false;
+    }
+#endif
+
+    if (adm_->InitRecording() != 0)
+    {
+        RTC_LOG(LS_ERROR) << "InitRecording failed on the selected audio device";
+        return false;
+    }
+
     return true;
 }
 
@@ -536,7 +912,6 @@ bool WebRTCPushClient::AddLocalAudio()
     if (!factory_ || !pc_)
         return false;
 
-    // 当前默认使用 dummy ADM，因此这里只演示音频轨创建流程，未接入真实桌面音频采集后端。
     webrtc::AudioOptions options;
     auto audio_source = factory_->CreateAudioSource(options);
     if (!audio_source)
@@ -578,7 +953,7 @@ bool WebRTCPushClient::AddDesktopVideo(int fps, int max_bitrate_bps)
         return false;
     }
 
-    video_track_ = factory_->CreateVideoTrack(capture_source_, "desktop");
+    video_track_ = factory_->CreateVideoTrack(file_source_, "ffmpeg");
     if (!video_track_)
     {
         printf("Failed to create VideoTrack\n");
@@ -608,7 +983,7 @@ bool WebRTCPushClient::AddDesktopVideo(int fps, int max_bitrate_bps)
         }
     }
 
-    capture_source_->Start();
+    file_source_->Start();
     return true;
 }
 
