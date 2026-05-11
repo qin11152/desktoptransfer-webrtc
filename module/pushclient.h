@@ -341,6 +341,8 @@ private:
     bool ConfigureAudioCaptureDevice();
     bool ConfigureAudioCodecPreferences(webrtc::RtpTransceiverInterface *transceiver);
     bool ConfigureAudioSenderParameters();
+    bool ConfigureAbsoluteCaptureTimeHeaderExtension(webrtc::RtpTransceiverInterface *transceiver,
+                                                     const char *media_label);
 
     // PeerConnection 及其相关媒体对象。
     webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc_;

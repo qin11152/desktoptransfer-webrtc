@@ -1,5 +1,9 @@
 #include "pushclient.h"
 
+#if defined(TWEBRTC_USE_PULSE_SIMPLE_CAPTURE)
+#include "pulse_loopback_audio_device_module.h"
+#endif
+
 #include "api/audio_options.h"
 #include "media/engine/webrtc_media_engine.h"
 #include "media/engine/webrtc_video_engine.h"
@@ -33,6 +37,7 @@
 #include "api/stats/rtc_stats.h"
 #include "api/stats/rtc_stats_collector_callback.h"
 #include "api/stats/rtcstats_objects.h"
+#include "api/rtp_parameters.h"
 
 #include <algorithm>
 #include <cctype>
@@ -51,6 +56,18 @@ std::string AsciiLower(std::string value)
 std::string BoolToFmtpValue(bool enabled)
 {
     return enabled ? "1" : "0";
+}
+
+struct CaptureClockSample
+{
+    int64_t monotonic_time_us;
+    int64_t utc_time_ms;
+};
+
+CaptureClockSample SampleCaptureClock()
+{
+    const int64_t monotonic_time_us = webrtc::TimeMicros();
+    return {monotonic_time_us, webrtc::TimeUTCMillis()};
 }
 
 bool LooksLikeSystemLoopbackDevice(const char* name, const char* guid)
@@ -133,6 +150,18 @@ webrtc::scoped_refptr<webrtc::AudioDeviceModule> CreatePlatformAudioDeviceModule
 {
 #if defined(TWEBRTC_PLATFORM_LINUX)
     OverridePulseSourceWithMonitorIfAvailable();
+
+#if defined(TWEBRTC_USE_PULSE_SIMPLE_CAPTURE)
+    const char* pulse_source = std::getenv("PULSE_SOURCE");
+    auto loopback_adm = PulseLoopbackAudioDeviceModule::Create(pulse_source ? pulse_source : "");
+    if (loopback_adm)
+    {
+        RTC_LOG(LS_INFO) << "Using custom PulseAudio loopback ADM for capture-side synchronized system audio.";
+        return loopback_adm;
+    }
+
+    RTC_LOG(LS_WARNING) << "Failed to create custom PulseAudio loopback ADM, falling back to WebRTC built-in ADM.";
+#endif
 
     auto adm = webrtc::CreateAudioDeviceModule(env, webrtc::AudioDeviceModule::kLinuxPulseAudio);
     if (adm)
@@ -444,9 +473,11 @@ void CapturerTrackSource::StartCaptureLoop(int target_fps, bool capture_cursor)
                 output_buffer = scaled_buffer;
             }
 
+            const CaptureClockSample capture_clock = SampleCaptureClock();
             webrtc::VideoFrame vf = webrtc::VideoFrame::Builder()
                                         .set_video_frame_buffer(output_buffer)
-                                        .set_timestamp_us(webrtc::TimeMicros())
+                                        .set_timestamp_us(capture_clock.monotonic_time_us)
+                                        .set_ntp_time_ms(capture_clock.utc_time_ms)
                                         .build();
 
             // src_->OnFrame(vf);
@@ -569,10 +600,12 @@ void FileVideoTrackSource::RunFrameLoop()
             FillSyntheticI420Frame(buffer.get(), frame_index);
         }
 
+        const CaptureClockSample capture_clock = SampleCaptureClock();
         webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
-                                       .set_video_frame_buffer(buffer)
-                                       .set_timestamp_us(webrtc::TimeMicros())
-                                       .build();
+                           .set_video_frame_buffer(buffer)
+                           .set_timestamp_us(capture_clock.monotonic_time_us)
+                           .set_ntp_time_ms(capture_clock.utc_time_ms)
+                           .build();
         broadcaster_.OnFrame(frame);
 
         ++frame_index;
@@ -997,6 +1030,7 @@ bool WebRTCPushClient::AddLocalAudio()
     }
 
     auto transceiver = transceiver_or.value();
+    ConfigureAbsoluteCaptureTimeHeaderExtension(transceiver.get(), "audio");
     if (!ConfigureAudioCodecPreferences(transceiver.get()))
     {
         RTC_LOG(LS_ERROR) << "Failed to configure audio codec preferences";
@@ -1048,6 +1082,56 @@ bool WebRTCPushClient::ConfigureAudioCodecPreferences(webrtc::RtpTransceiverInte
     if (!error.ok())
     {
         RTC_LOG(LS_ERROR) << "SetCodecPreferences failed: " << error.message();
+        return false;
+    }
+
+    return true;
+}
+
+bool WebRTCPushClient::ConfigureAbsoluteCaptureTimeHeaderExtension(webrtc::RtpTransceiverInterface *transceiver,
+                                                                  const char *media_label)
+{
+    if (!transceiver)
+    {
+        return false;
+    }
+
+    auto header_extensions = transceiver->GetHeaderExtensionsToNegotiate();
+    bool changed = false;
+    bool supported = false;
+    for (auto &extension : header_extensions)
+    {
+        if (extension.uri != webrtc::RtpExtension::kAbsoluteCaptureTimeUri)
+        {
+            continue;
+        }
+
+        supported = true;
+        if (extension.direction == webrtc::RtpTransceiverDirection::kStopped)
+        {
+            extension.direction = webrtc::RtpTransceiverDirection::kSendOnly;
+            changed = true;
+        }
+        break;
+    }
+
+    if (!supported)
+    {
+        RTC_LOG(LS_WARNING) << "Absolute Capture Time RTP header extension is not advertised for " << media_label
+                            << "; downstream timestamp propagation may be limited.";
+        return true;
+    }
+
+    if (!changed)
+    {
+        return true;
+    }
+
+    auto error = transceiver->SetHeaderExtensionsToNegotiate(header_extensions);
+    if (!error.ok())
+    {
+        RTC_LOG(LS_ERROR) << "Failed to enable Absolute Capture Time header extension for " << media_label
+                          << ": " << error.message();
         return false;
     }
 
@@ -1119,6 +1203,7 @@ bool WebRTCPushClient::AddDesktopVideo(int fps, int max_bitrate_bps)
         return false;
     }
     auto transceiver = transceiver_or.value();
+    ConfigureAbsoluteCaptureTimeHeaderExtension(transceiver.get(), "video");
     video_sender_ = transceiver->sender();
 
     // 设置编码器初始码率上限，避免桌面流默认码率过高。
