@@ -107,8 +107,9 @@ set(WEBRTC_ABSL_DIR "${THIRD_PARTY_INCLUDE_DIR}/rtc/third_party/abseil-cpp"
 
 function(webrtc_is_complete_absl_tree dir result_var)
     if(EXISTS "${dir}/absl/numeric/int128.h"
-       AND EXISTS "${dir}/absl/numeric/int128_have_intrinsic.inc"
-       AND EXISTS "${dir}/absl/numeric/int128_no_intrinsic.inc")
+    #    AND EXISTS "${dir}/absl/numeric/int128_have_intrinsic.inc"
+    #    AND EXISTS "${dir}/absl/numeric/int128_no_intrinsic.inc"
+       )
         set(${result_var} TRUE PARENT_SCOPE)
     else()
         set(${result_var} FALSE PARENT_SCOPE)
@@ -118,7 +119,7 @@ endfunction()
 set(_webrtc_absl_candidates
     "${WEBRTC_ABSL_DIR}"
     "${THIRD_PARTY_INCLUDE_DIR}/rtc/third_party/abseil-cpp"
-    "/home/qin/sdk/rtc/webrtc-checkout/src/third_party/abseil-cpp")
+    )
 
 set(_webrtc_absl_resolved "")
 foreach(_webrtc_absl_candidate IN LISTS _webrtc_absl_candidates)
